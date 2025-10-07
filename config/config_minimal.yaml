@@ -1,0 +1,34 @@
+# Minimal Configuration for Testing SAE Training
+# Qwen3-32B with 8bit quantization, minimal diary generation
+
+# Model settings
+model:
+  name: "Qwen/Qwen3-32B"
+
+  quantization:
+    enabled: true
+    type: "8bit"
+    load_in_8bit: true
+    load_in_4bit: false
+
+  dtype: "bfloat16"
+  device_map: "auto"
+
+# Generation settings
+generation:
+  max_new_tokens: 100  # Reduced from 200 for faster generation
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+  do_sample: true
+
+# Thinking mode settings
+thinking:
+  enabled: false
+
+# Data generation settings (MINIMAL)
+data:
+  num_baseline_days: 3  # Reduced from 5
+  num_grief_days: 3     # Reduced from 5
+  loss_day: 6
+  base_dir: "data"

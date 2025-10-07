@@ -1,0 +1,7 @@
+data
+activations
+models/*.pt
+*.json
+*.png
+*.pyc
+layer20

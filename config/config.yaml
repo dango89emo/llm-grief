@@ -1,0 +1,45 @@
+# Model Configuration for LLM Grief Diary Generation
+
+# Model settings
+model:
+  # Model name from HuggingFace
+  name: "Qwen/Qwen3-14B"
+
+  # Quantization settings
+  quantization:
+    enabled: false
+    # Options: "8bit", "4bit", or null for no quantization
+    type: null
+    # Load model in 8bit mode (requires bitsandbytes)
+    load_in_8bit: false
+    # Load model in 4bit mode (requires bitsandbytes)
+    load_in_4bit: false
+
+  # Data type for model weights (when quantization is disabled)
+  # Options: "float32", "float16", "bfloat16"
+  dtype: "bfloat16"
+
+  # Device placement strategy
+  # "auto" will automatically distribute model across available devices
+  device_map: "auto"
+
+# Generation settings
+generation:
+  max_new_tokens: 200
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+  do_sample: true
+
+# Thinking mode settings
+thinking:
+  # Enable thinking mode for Qwen3 models
+  # When disabled, "/no_think" will be added to system prompt
+  enabled: true 
+
+# Data generation settings
+data:
+  num_baseline_days: 5
+  num_grief_days: 5
+  loss_day: 6
+  base_dir: "data"

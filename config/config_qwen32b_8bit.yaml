@@ -1,0 +1,41 @@
+# Model Configuration for Qwen3-32B with 8bit quantization
+
+# Model settings
+model:
+  # Model name from HuggingFace
+  name: "Qwen/Qwen3-32B"
+
+  # Quantization settings
+  quantization:
+    enabled: true
+    # Using 8bit quantization for memory efficiency
+    type: "8bit"
+    load_in_8bit: true
+    load_in_4bit: false
+
+  # Data type is managed by quantization when enabled
+  dtype: "bfloat16"
+
+  # Device placement strategy
+  device_map: "auto"
+
+# Generation settings
+generation:
+  max_new_tokens: 200
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+  do_sample: true
+
+# Thinking mode settings
+thinking:
+  # Enable thinking mode for Qwen3 models
+  # When disabled, "/no_think" will be added to system prompt
+  enabled: false
+
+# Data generation settings
+data:
+  num_baseline_days: 5
+  num_grief_days: 5
+  loss_day: 6
+  base_dir: "data"
