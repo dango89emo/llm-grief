@@ -599,9 +599,12 @@ def visualize_tsne(
         "token_type": token_types,
     })
 
+    # Drop full decoded context from interactive plot to avoid exposing entire diary text
+    plot_df = df.drop(columns=["decoded_text"])
+
     # Create plotly scatter plot
     fig = px.scatter(
-        df,
+        plot_df,
         x="tsne_1",
         y="tsne_2",
         color="state",
@@ -615,7 +618,6 @@ def visualize_tsne(
             "token_index": True,
             "token": True,
             "token_type": True,
-            "decoded_text": True,
         },
         title="t-SNE Visualization: Baseline vs Grief SAE Features (Interactive)",
         labels={

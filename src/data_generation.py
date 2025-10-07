@@ -267,17 +267,22 @@ def create_diary_prompt(
     persona_description: str,
     day_number: int,
     is_after_loss: bool = False,
-    loss_event: str = None,
+    loss_event: Optional[str] = None,
     thinking_enabled: bool = False,
+    context_diaries: Optional[List[Tuple[int, str]]] = None,
+    loss_event_message: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """
     Create diary generation prompt for Qwen3.
+
     Args:
         persona_description: Persona background and instructions
         day_number: Current day number
         is_after_loss: Whether this is after the loss event
-        loss_event: Description of the loss event
+        loss_event: (Deprecated) Description of the loss event
         thinking_enabled: Whether to enable thinking mode
+        context_diaries: Optional list of (day_number, diary_text) tuples for past entries
+        loss_event_message: Optional message describing the loss event (sent once)
 
     Returns:
         List of message dictionaries for chat template
@@ -294,11 +299,28 @@ def create_diary_prompt(
         }
     ]
 
-    if is_after_loss and loss_event:
-        messages.append({"role": "user", "content": f"重要な出来事: {loss_event}"})
+    if context_diaries:
+        context_lines = [
+            f"Day {day_idx}: {diary_text}"
+            for day_idx, diary_text in context_diaries
+        ]
+        context_text = "これまでの日記:\n" + "\n".join(context_lines)
+        messages.append({"role": "user", "content": context_text})
+
+    if loss_event_message is None and is_after_loss and loss_event:
+        loss_event_message = loss_event
+
+    if loss_event_message:
+        messages.append({"role": "user", "content": f"重要な出来事: {loss_event_message}"})
 
     messages.append(
-        {"role": "user", "content": f"Day {day_number}の日記を書いてください。"}
+        {
+            "role": "user",
+            "content": (
+                f"Day {day_number}の日記を書いてください。"
+                "これまでの日記に触れながら、自然な流れで継続した内容になるようにしてください。"
+            ),
+        }
     )
 
     return messages
@@ -495,8 +517,13 @@ def generate_baseline_diaries(
 
     for day in range(1, num_days + 1):
         print(f"  Generating Day {day}...", end=" ")
+        previous_entries = list(enumerate(diaries, start=1)) if diaries else None
         messages = create_diary_prompt(
-            persona["description"], day, is_after_loss=False, thinking_enabled=thinking_enabled
+            persona["description"],
+            day,
+            is_after_loss=False,
+            thinking_enabled=thinking_enabled,
+            context_diaries=previous_entries,
         )
         diary, activations, tokens = generate_diary(
             messages, model, tokenizer, generation_config, activation_collector
@@ -520,6 +547,7 @@ def generate_grief_diaries(
     generation_config: Dict,
     num_days: int = 5,
     loss_day: int = 6,
+    baseline_diaries: Optional[List[str]] = None,
     thinking_enabled: bool = False,
     activation_collector: Optional[ActivationCollector] = None,
 ) -> Tuple[List[str], List[Optional[torch.Tensor]], List[Optional[List[str]]]]:
@@ -533,6 +561,7 @@ def generate_grief_diaries(
         generation_config: Generation parameters
         num_days: Number of grief days to generate
         loss_day: Day number when loss event occurred
+        baseline_diaries: Previously generated baseline diaries to provide context
         thinking_enabled: Whether to enable thinking mode
         activation_collector: Optional collector to gather activations
 
@@ -543,15 +572,32 @@ def generate_grief_diaries(
     diaries = []
     activations_list = []
     tokens_list = []
+    baseline_history = baseline_diaries or []
+    grief_start_day = loss_day + 1
 
     for day in range(loss_day + 1, loss_day + 1 + num_days):
         print(f"  Generating Day {day}...", end=" ")
+        previous_entries: List[Tuple[int, str]] = []
+        if baseline_history:
+            previous_entries.extend(
+                [(idx, text) for idx, text in enumerate(baseline_history, start=1)]
+            )
+        if diaries:
+            previous_entries.extend(
+                [
+                    (grief_start_day + idx, text)
+                    for idx, text in enumerate(diaries)
+                ]
+            )
+        loss_event_message = persona["loss_event"] if day == grief_start_day else None
+
         messages = create_diary_prompt(
             persona["description"],
             day,
             is_after_loss=True,
-            loss_event=persona["loss_event"],
             thinking_enabled=thinking_enabled,
+            context_diaries=previous_entries or None,
+            loss_event_message=loss_event_message,
         )
         diary, activations, tokens = generate_diary(
             messages, model, tokenizer, generation_config, activation_collector
@@ -780,16 +826,24 @@ def generate_all_personas_batch(
             batch_personas = personas[batch_idx:batch_idx + batch_size]
             print(f"    Batch {batch_idx//batch_size + 1}/{(len(personas) + batch_size - 1)//batch_size} (personas {batch_idx + 1}-{min(batch_idx + batch_size, len(personas))})...", end=" ")
 
-            # Create prompts for this batch
-            messages_list = [
-                create_diary_prompt(
-                    persona["description"],
-                    day,
-                    is_after_loss=False,
-                    thinking_enabled=thinking_enabled
+            # Create prompts for this batch (include prior diaries for continuity)
+            messages_list = []
+            for persona in batch_personas:
+                pid = persona["persona_id"]
+                previous_entries = [
+                    (idx, text)
+                    for idx, text in enumerate(results[pid]["baseline"], start=1)
+                ] if results[pid]["baseline"] else None
+
+                messages_list.append(
+                    create_diary_prompt(
+                        persona["description"],
+                        day,
+                        is_after_loss=False,
+                        thinking_enabled=thinking_enabled,
+                        context_diaries=previous_entries,
+                    )
                 )
-                for persona in batch_personas
-            ]
 
             # Batch generate
             diaries, activations, tokens = generate_diaries_batch(
@@ -818,17 +872,41 @@ def generate_all_personas_batch(
             batch_personas = personas[batch_idx:batch_idx + batch_size]
             print(f"    Batch {batch_idx//batch_size + 1}/{(len(personas) + batch_size - 1)//batch_size} (personas {batch_idx + 1}-{min(batch_idx + batch_size, len(personas))})...", end=" ")
 
-            # Create prompts for this batch
-            messages_list = [
-                create_diary_prompt(
-                    persona["description"],
-                    day,
-                    is_after_loss=True,
-                    loss_event=persona["loss_event"],
-                    thinking_enabled=thinking_enabled
+            # Create prompts for this batch (baseline + previous grief diaries as context)
+            messages_list = []
+            for persona in batch_personas:
+                pid = persona["persona_id"]
+                previous_entries: List[Tuple[int, str]] = []
+
+                if results[pid]["baseline"]:
+                    previous_entries.extend(
+                        [
+                            (idx, text)
+                            for idx, text in enumerate(results[pid]["baseline"], start=1)
+                        ]
+                    )
+
+                existing_grief = results[pid]["grief"]
+                if existing_grief:
+                    previous_entries.extend(
+                        [
+                            (loss_day + 1 + idx, text)
+                            for idx, text in enumerate(existing_grief)
+                        ]
+                    )
+
+                loss_event_message = persona["loss_event"] if not existing_grief else None
+
+                messages_list.append(
+                    create_diary_prompt(
+                        persona["description"],
+                        day,
+                        is_after_loss=True,
+                        thinking_enabled=thinking_enabled,
+                        context_diaries=previous_entries if previous_entries else None,
+                        loss_event_message=loss_event_message,
+                    )
                 )
-                for persona in batch_personas
-            ]
 
             # Batch generate
             diaries, activations, tokens = generate_diaries_batch(
@@ -973,7 +1051,15 @@ def main(config_path: str = "config.yaml", layer_idx: int = 20, collect_activati
 
             # Generate grief diaries
             grief_diaries, grief_activations, grief_tokens = generate_grief_diaries(
-                persona, model, tokenizer, generation_config, num_grief_days, loss_day=loss_day, thinking_enabled=thinking_enabled, activation_collector=activation_collector
+                persona,
+                model,
+                tokenizer,
+                generation_config,
+                num_grief_days,
+                loss_day=loss_day,
+                baseline_diaries=baseline_diaries,
+                thinking_enabled=thinking_enabled,
+                activation_collector=activation_collector,
             )
 
             # Save all data for this persona

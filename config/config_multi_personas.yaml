@@ -1,13 +1,13 @@
-# Configuration for Multiple Personas with More Days
-# Qwen3-32B with 8bit quantization, multiple personas, extended diary generation
+# Configuration for Multiple Personas (Short Duration)
+# Qwen3-32B with 8bit quantization, multiple personas, short diary generation
 
 # Model settings
 model:
-  name: "Qwen/Qwen3-32B"
+  name: "Qwen/Qwen3-14B"
 
   quantization:
     enabled: true
-    type: "8bit"
+    # type: "8bit"
     load_in_8bit: true
     load_in_4bit: false
 
@@ -26,13 +26,13 @@ generation:
 thinking:
   enabled: false  # Disable for faster generation
 
-# Data generation settings (EXTENDED for multiple personas)
+# Data generation settings (short duration for multiple personas)
 data:
-  num_baseline_days: 15   # Increased from 5
-  num_grief_days: 15      # Increased from 5
-  loss_day: 16            # Loss event occurs on day 16
+  num_baseline_days: 3    # Reduced duration before loss
+  num_grief_days: 3       # Reduced duration after loss
+  loss_day: 4             # Loss event occurs on day 4
   base_dir: "data"
 
 # Expected data volume:
-# 5 personas × 30 diaries × ~150 tokens/diary = ~22,500 tokens
-# This should provide sufficient data for SAE training
+# 5 personas × 6 diaries × ~150 tokens/diary = ~4,500 tokens
+# Adjust SAE training config if more data is needed
