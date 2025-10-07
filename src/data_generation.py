@@ -5,8 +5,6 @@ Generates baseline and grief diaries for a single persona.
 Also collects activations during generation.
 """
 
-import json
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -14,129 +12,14 @@ import torch
 import yaml
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-
-class ActivationCollector:
-    """Collects activations from specified model layers during generation."""
-
-    def __init__(self, model: AutoModelForCausalLM, layer_idx: int = 20):
-        """
-        Initialize activation collector.
-
-        Args:
-            model: Loaded Qwen3 model
-            layer_idx: Index of layer to collect activations from
-        """
-        self.model = model
-        self.layer_idx = layer_idx
-        self.activations = []  # List to accumulate all activations
-        self.hook_handle = None
-
-    def _get_activation_hook(self, name: str):
-        """Create hook function to capture activations."""
-
-        def hook(module, input, output):
-            # output: [batch_size, seq_len, hidden_dim]
-            # Accumulate activations from each forward pass
-            self.activations.append(output.detach().cpu())
-
-        return hook
-
-    def register_hook(self):
-        """Register forward hook on target layer."""
-        target_layer = self.model.model.layers[self.layer_idx].mlp
-        hook_name = f"layer_{self.layer_idx}_mlp"
-        self.hook_handle = target_layer.register_forward_hook(
-            self._get_activation_hook(hook_name)
-        )
-        print(f"Registered activation hook at layer {self.layer_idx} (MLP)")
-
-    def remove_hook(self):
-        """Remove the registered hook."""
-        if self.hook_handle:
-            self.hook_handle.remove()
-
-    def get_last_activations(self) -> Optional[torch.Tensor]:
-        """
-        Get all accumulated activations from generation.
-
-        Returns:
-            Activations tensor [total_seq_len, hidden_dim] or None (for batch_size=1)
-            For batch_size>1, returns [batch_size, total_seq_len, hidden_dim]
-        """
-        if not self.activations:
-            return None
-
-        # Check batch size from first activation
-        batch_size = self.activations[0].shape[0]
-
-        if batch_size == 1:
-            # Single sample: squeeze batch dimension
-            all_acts = []
-            for act in self.activations:
-                act_squeezed = act.squeeze(0)  # [seq_len, hidden_dim]
-                all_acts.append(act_squeezed)
-
-            if all_acts:
-                combined = torch.cat(all_acts, dim=0)  # [total_seq_len, hidden_dim]
-                return combined
-        else:
-            # Batch mode: keep batch dimension
-            # Return raw activations for batch processing
-            # Concatenate along sequence dimension for each batch element
-            return self.activations  # Return list of [batch_size, seq_len, hidden_dim]
-
-        return None
-
-    def get_batch_activations_separated(self, generated_ids: torch.Tensor, pad_token_id: int) -> List[torch.Tensor]:
-        """
-        Separate batch activations into per-sample activations.
-
-        Args:
-            generated_ids: Generated token IDs [batch_size, seq_len]
-            pad_token_id: Padding token ID to identify valid positions
-
-        Returns:
-            List of activation tensors, one per sample [sample_seq_len, hidden_dim]
-        """
-        if not self.activations:
-            return [None] * generated_ids.shape[0]
-
-        batch_size = generated_ids.shape[0]
-        separated = []
-
-        # For batch inference, activations structure is complex due to autoregressive generation
-        # We'll use a simpler approach: collect all activations and split by valid (non-padded) positions
-
-        # Concatenate all activations across forward passes
-        # Each element in self.activations is [batch_size, seq_len_i, hidden_dim]
-        all_acts_batched = []
-        for act in self.activations:
-            all_acts_batched.append(act)  # Keep batch dimension
-
-        # For each sample in batch, extract its activations
-        for b in range(batch_size):
-            sample_acts = []
-            for act in all_acts_batched:
-                # Extract this sample's activations: [seq_len_i, hidden_dim]
-                sample_acts.append(act[b])
-
-            # Concatenate along sequence dimension
-            if sample_acts:
-                combined = torch.cat(sample_acts, dim=0)  # [total_seq_len, hidden_dim]
-
-                # Note: For batch inference, the sequence lengths may include padding
-                # We should ideally filter by valid positions, but this requires
-                # careful tracking of which tokens are padding
-                # For now, we keep all activations
-                separated.append(combined)
-            else:
-                separated.append(None)
-
-        return separated
-
-    def clear_activations(self):
-        """Clear stored activations."""
-        self.activations = []
+from activation_collector import ActivationCollector
+from generation.postprocess import (
+    build_token_metadata,
+    compute_prompt_length,
+    slice_activations,
+    strip_padding,
+)
+from generation.storage import TokenMetadata, save_persona_artifacts
 
 
 def load_config(config_path: str = "config.yaml") -> Dict:
@@ -332,7 +215,7 @@ def generate_diary(
     tokenizer: AutoTokenizer,
     generation_config: Dict,
     activation_collector: Optional[ActivationCollector] = None,
-) -> Tuple[str, Optional[torch.Tensor], Optional[List[str]]]:
+) -> Tuple[str, Optional[torch.Tensor], TokenMetadata]:
     """
     Generate a single diary entry using Qwen3.
 
@@ -364,46 +247,18 @@ def generate_diary(
 
     prompt_len = model_inputs.input_ids.shape[1]
     full_sequence_ids = generated_ids[0].tolist()
+    generated_only_ids = full_sequence_ids[prompt_len:]
 
     # Get activations if collector is present
     activations = None
     tokens = None
     if activation_collector:
-        activations = activation_collector.get_last_activations()
-        generated_only_ids = full_sequence_ids[prompt_len:]
-        if isinstance(activations, torch.Tensor):
-            if activations.dim() == 2:
-                activations = activations[prompt_len:]
-            elif activations.dim() == 3:
-                activations = activations[:, prompt_len:]
-        else:
-            activations = None
-        # Get tokens for the full sequence (input + generated)
-        # Store both individual token text and the full decoded text for each position
-        if generated_only_ids:
-            tokens = []
-            for i, tid in enumerate(generated_only_ids):
-                # Decode individual token (may be incomplete for multi-byte chars)
-                token_text = tokenizer.decode([tid], skip_special_tokens=False)
-                # Decode only the generated portion up to current position
-                decoded_so_far = tokenizer.decode(
-                    generated_only_ids[: i + 1], skip_special_tokens=True
-                )
-                tokens.append(
-                    {
-                        "token_id": tid,  # Store token ID for reference
-                        "token_text": token_text,
-                        "decoded_context": decoded_so_far,
-                    }
-                )
+        activations = slice_activations(
+            activation_collector.get_last_activations(), prompt_len
+        )
+        tokens = build_token_metadata(tokenizer, generated_only_ids)
 
-    # Decode, removing the input prompt
-    generated_ids = [
-        output_ids[len(input_ids) :]
-        for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-    ]
-
-    response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    response = tokenizer.decode(generated_only_ids, skip_special_tokens=True)
 
     return response.strip(), activations, tokens
 
@@ -414,7 +269,7 @@ def generate_diaries_batch(
     tokenizer: AutoTokenizer,
     generation_config: Dict,
     activation_collector: Optional[ActivationCollector] = None,
-) -> Tuple[List[str], List[Optional[torch.Tensor]], List[Optional[List[str]]]]:
+) -> Tuple[List[str], List[Optional[torch.Tensor]], List[TokenMetadata]]:
     """
     Generate multiple diary entries in a single batch (parallel inference).
 
@@ -464,59 +319,34 @@ def generate_diaries_batch(
     activations_list = []
     tokens_list = []
 
-    for idx, (input_ids, output_ids) in enumerate(zip(model_inputs.input_ids, generated_ids)):
-        # Find the actual input length (excluding padding)
-        attention_mask = model_inputs.attention_mask[idx] if "attention_mask" in model_inputs else None
-        if attention_mask is not None:
-            actual_input_len = attention_mask.sum().item()
-        else:
-            pad_token_id = tokenizer.pad_token_id
-            if pad_token_id is not None:
-                actual_input_len = (input_ids != pad_token_id).sum().item()
-            else:
-                actual_input_len = input_ids.shape[0]
-        # Extract only the generated portion
-        generated_only = output_ids[actual_input_len:]
+    for sample_idx, (input_ids, output_ids) in enumerate(
+        zip(model_inputs.input_ids, generated_ids)
+    ):
+        attention_mask = (
+            model_inputs.attention_mask[sample_idx]
+            if "attention_mask" in model_inputs
+            else None
+        )
+        prompt_length = compute_prompt_length(
+            input_ids, attention_mask, tokenizer.pad_token_id
+        )
+
+        generated_only = output_ids[prompt_length:]
         response = tokenizer.decode(generated_only, skip_special_tokens=True)
         responses.append(response.strip())
 
         # Extract activations and tokens for this sample
         if activation_collector and separated_activations:
-            # Get tokens for the full sequence
-            # Store both individual token text and the full decoded text for each position
-            token_ids = output_ids.tolist()
-            pad_token_id = tokenizer.pad_token_id
-            token_ids_no_pad = (
-                [tid for tid in token_ids if tid != pad_token_id]
-                if pad_token_id is not None
-                else token_ids
-            )
-            generated_tokens = token_ids_no_pad[int(actual_input_len):]
-            tokens = []
-            for j, tid in enumerate(generated_tokens):
-                # Decode individual token (may be incomplete for multi-byte chars)
-                token_text = tokenizer.decode([tid], skip_special_tokens=False)
-                # Decode only the generated portion up to current position
-                decoded_so_far = tokenizer.decode(
-                    generated_tokens[: j + 1], skip_special_tokens=True
-                )
-                tokens.append(
-                    {
-                        "token_id": tid,  # Store token ID for reference
-                        "token_text": token_text,
-                        "decoded_context": decoded_so_far,
-                    }
-                )
-            tokens_list.append(tokens if tokens else None)
+            token_ids = strip_padding(output_ids.tolist(), tokenizer.pad_token_id)
+            generated_tokens = token_ids[int(prompt_length) :]
+            tokens_list.append(build_token_metadata(tokenizer, generated_tokens))
 
-            # Get separated activations for this sample
-            sample_act = separated_activations[idx] if idx < len(separated_activations) else None
-            if isinstance(sample_act, torch.Tensor):
-                if sample_act.dim() == 2 and sample_act.shape[0] >= int(actual_input_len):
-                    sample_act = sample_act[int(actual_input_len):]
-                elif sample_act.dim() == 3 and sample_act.shape[1] >= int(actual_input_len):
-                    sample_act = sample_act[:, int(actual_input_len):]
-            activations_list.append(sample_act)
+            sample_act = (
+                separated_activations[sample_idx]
+                if sample_idx < len(separated_activations)
+                else None
+            )
+            activations_list.append(slice_activations(sample_act, int(prompt_length)))
         else:
             activations_list.append(None)
             tokens_list.append(None)
@@ -532,7 +362,7 @@ def generate_baseline_diaries(
     num_days: int = 5,
     thinking_enabled: bool = False,
     activation_collector: Optional[ActivationCollector] = None,
-) -> Tuple[List[str], List[Optional[torch.Tensor]], List[Optional[List[str]]]]:
+) -> Tuple[List[str], List[Optional[torch.Tensor]], List[TokenMetadata]]:
     """
     Generate baseline (pre-loss) diary entries.
 
@@ -588,7 +418,7 @@ def generate_grief_diaries(
     baseline_diaries: Optional[List[str]] = None,
     thinking_enabled: bool = False,
     activation_collector: Optional[ActivationCollector] = None,
-) -> Tuple[List[str], List[Optional[torch.Tensor]], List[Optional[List[str]]]]:
+) -> Tuple[List[str], List[Optional[torch.Tensor]], List[TokenMetadata]]:
     """
     Generate grief (post-loss) diary entries.
 
@@ -652,159 +482,6 @@ def generate_grief_diaries(
     return diaries, activations_list, tokens_list
 
 
-def save_diaries(
-    persona: Dict[str, str],
-    baseline_diaries: List[str],
-    grief_diaries: List[str],
-    model_name: str,
-    generation_config: Dict,
-    base_dir: str = "data",
-    baseline_activations: Optional[List[Optional[torch.Tensor]]] = None,
-    grief_activations: Optional[List[Optional[torch.Tensor]]] = None,
-    baseline_tokens: Optional[List[Optional[List[str]]]] = None,
-    grief_tokens: Optional[List[Optional[List[str]]]] = None,
-    layer_idx: Optional[int] = None,
-    loss_day: int = 6,
-) -> None:
-    """
-    Save generated diaries, activations, and metadata to filesystem.
-
-    Args:
-        persona: Persona information
-        baseline_diaries: List of baseline diary entries
-        grief_diaries: List of grief diary entries
-        model_name: Name of the model used
-        generation_config: Generation parameters used
-        base_dir: Base directory for saving data
-        baseline_activations: Optional list of baseline activations
-        grief_activations: Optional list of grief activations
-        baseline_tokens: Optional list of baseline tokens
-        grief_tokens: Optional list of grief tokens
-        layer_idx: Layer index used for activation collection
-    """
-    print("\nSaving diaries to filesystem...")
-
-    # Create directory structure
-    persona_dir = Path(base_dir) / f"persona_{persona['persona_id']}"
-    baseline_dir = persona_dir / "baseline"
-    grief_dir = persona_dir / "grief"
-
-    baseline_dir.mkdir(parents=True, exist_ok=True)
-    grief_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create activations directories if needed
-    if baseline_activations or grief_activations:
-        activations_dir = Path("activations") / f"persona_{persona['persona_id']}"
-        baseline_act_dir = activations_dir / "baseline"
-        grief_act_dir = activations_dir / "grief"
-        baseline_act_dir.mkdir(parents=True, exist_ok=True)
-        grief_act_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save baseline diaries and activations
-    for i, diary in enumerate(baseline_diaries, start=1):
-        diary_path = baseline_dir / f"day{i:04d}.txt"
-        diary_path.write_text(diary, encoding="utf-8")
-
-        # Save activations if available
-        if baseline_activations and i - 1 < len(baseline_activations):
-            activations = baseline_activations[i - 1]
-            if activations is not None:
-                act_path = baseline_act_dir / f"day{i:04d}.pt"
-                torch.save(activations, act_path)
-
-                # Save tokens if available
-                if baseline_tokens and i - 1 < len(baseline_tokens):
-                    tokens = baseline_tokens[i - 1]
-                    if tokens is not None:
-                        tokens_path = baseline_act_dir / f"day{i:04d}_tokens.json"
-                        with open(tokens_path, "w", encoding="utf-8") as f:
-                            json.dump(tokens, f, ensure_ascii=False, indent=2)
-
-    print(f"  Saved {len(baseline_diaries)} baseline diaries")
-
-    # Save grief diaries and activations
-    for i, diary in enumerate(grief_diaries, start=loss_day + 1):
-        diary_path = grief_dir / f"day{i:04d}.txt"
-        diary_path.write_text(diary, encoding="utf-8")
-
-        # Save activations if available
-        grief_idx = i - (loss_day + 1)
-        if grief_activations and grief_idx < len(grief_activations):
-            activations = grief_activations[grief_idx]
-            if activations is not None:
-                act_path = grief_act_dir / f"day{i:04d}.pt"
-                torch.save(activations, act_path)
-
-                # Save tokens if available
-                if grief_tokens and grief_idx < len(grief_tokens):
-                    tokens = grief_tokens[grief_idx]
-                    if tokens is not None:
-                        tokens_path = grief_act_dir / f"day{i:04d}_tokens.json"
-                        with open(tokens_path, "w", encoding="utf-8") as f:
-                            json.dump(tokens, f, ensure_ascii=False, indent=2)
-
-    print(f"  Saved {len(grief_diaries)} grief diaries")
-
-    # Save loss event
-    loss_event_path = persona_dir / "loss_event.txt"
-    loss_event_path.write_text(persona["loss_event"], encoding="utf-8")
-    print("  Saved loss event")
-
-    # Save metadata
-    metadata = {
-        "persona_id": persona["persona_id"],
-        "name": persona["name"],
-        "age": persona["age"],
-        "occupation": persona["occupation"],
-        "important_other": persona["important_other"],
-        "generation_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "model": model_name,
-        "model_dtype": "bfloat16",
-        "num_baseline_days": len(baseline_diaries),
-        "num_grief_days": len(grief_diaries),
-        "generation_config": generation_config,
-    }
-
-    # Add activation info if available
-    if baseline_activations or grief_activations:
-        metadata["activation_collection"] = {
-            "layer_idx": layer_idx,
-            "collected": True,
-        }
-        # Get hidden_dim from first available activation
-        for act in baseline_activations or grief_activations:
-            if act is not None:
-                metadata["activation_collection"]["hidden_dim"] = act.shape[-1]
-                break
-
-    metadata_path = persona_dir / "metadata.json"
-    with open(metadata_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, ensure_ascii=False, indent=2)
-    print("  Saved metadata.json")
-
-    # Save activation metadata if activations were collected
-    if baseline_activations or grief_activations:
-        total_tokens = 0
-        for tokens in (baseline_tokens or []) + (grief_tokens or []):
-            if tokens is not None:
-                total_tokens += len(tokens)
-
-        act_metadata = {
-            "persona_id": persona["persona_id"],
-            "layer_idx": layer_idx,
-            "collection_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "model": model_name,
-            "total_tokens": total_tokens,
-        }
-
-        act_metadata_path = activations_dir / "metadata.json"
-        with open(act_metadata_path, "w", encoding="utf-8") as f:
-            json.dump(act_metadata, f, ensure_ascii=False, indent=2)
-        print(f"  Saved activation metadata")
-
-    print(f"\nAll data saved to: {persona_dir}")
-    if baseline_activations or grief_activations:
-        print(f"Activations saved to: {activations_dir}")
 
 
 def generate_all_personas_batch(
@@ -997,7 +674,7 @@ def main(config_path: str = "config.yaml", layer_idx: int = 20, collect_activati
     data_config = config["data"]
     num_baseline_days = data_config["num_baseline_days"]
     num_grief_days = data_config["num_grief_days"]
-    base_dir = data_config["base_dir"]
+    base_dir = Path(data_config["base_dir"])
     loss_day = data_config.get("loss_day", num_baseline_days + 1)
 
     # Get thinking mode setting
@@ -1060,16 +737,23 @@ def main(config_path: str = "config.yaml", layer_idx: int = 20, collect_activati
             grief_tokens = batch_results[pid].get("grief_tokens") if collect_activations else None
 
             print(f"\nSaving data for {persona['name']}...")
-            save_diaries(
-                persona, baseline_diaries, grief_diaries, model_name,
-                generation_config, base_dir,
+            persona_dir, activations_dir = save_persona_artifacts(
+                persona=persona,
+                baseline_diaries=baseline_diaries,
+                grief_diaries=grief_diaries,
+                model_name=model_name,
+                generation_config=generation_config,
+                base_dir=base_dir,
+                loss_day=loss_day,
                 baseline_activations=baseline_activations,
                 grief_activations=grief_activations,
                 baseline_tokens=baseline_tokens,
                 grief_tokens=grief_tokens,
                 layer_idx=layer_idx if collect_activations else None,
-                loss_day=loss_day
             )
+            print(f"  Diaries: {persona_dir}")
+            if activations_dir:
+                print(f"  Activations: {activations_dir}")
 
     # Sequential mode (with or without activation collection)
     else:
@@ -1101,15 +785,23 @@ def main(config_path: str = "config.yaml", layer_idx: int = 20, collect_activati
             )
 
             # Save all data for this persona
-            save_diaries(
-                persona, baseline_diaries, grief_diaries, model_name, generation_config, base_dir,
+            persona_dir, activations_dir = save_persona_artifacts(
+                persona=persona,
+                baseline_diaries=baseline_diaries,
+                grief_diaries=grief_diaries,
+                model_name=model_name,
+                generation_config=generation_config,
+                base_dir=base_dir,
+                loss_day=loss_day,
                 baseline_activations=baseline_activations if collect_activations else None,
                 grief_activations=grief_activations if collect_activations else None,
                 baseline_tokens=baseline_tokens if collect_activations else None,
                 grief_tokens=grief_tokens if collect_activations else None,
                 layer_idx=layer_idx if collect_activations else None,
-                loss_day=loss_day,
             )
+            print(f"  Diaries: {persona_dir}")
+            if activations_dir:
+                print(f"  Activations: {activations_dir}")
 
     # Remove hook if collector was used
     if activation_collector:
@@ -1121,12 +813,12 @@ def main(config_path: str = "config.yaml", layer_idx: int = 20, collect_activati
     print(f"\nGenerated data for {len(personas)} persona(s)")
     print(f"Total diaries: {len(personas) * (num_baseline_days + num_grief_days)}")
     print("\nNext steps:")
-    print(f"1. Review generated diaries in {base_dir}/persona_*/")
+    print(f"1. Review generated diaries in {base_dir / 'persona_*'}")
     print("2. Verify baseline diaries show normal daily life")
     print("3. Verify grief diaries show emotional response to loss")
     print("4. Check metadata.json for generation details")
     if collect_activations:
-        print("5. Review activations in activations/persona_*/")
+        print(f"5. Review activations in {Path('activations') / 'persona_*'}")
         print("6. Proceed to SAE training: python src/train_sae.py")
 
 
