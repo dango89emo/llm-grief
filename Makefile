@@ -24,7 +24,7 @@ generate:
 
 # Generate diaries for multiple personas using batch inference (fast)
 generate-batch:
-	$(PYTHON) src/data_generation.py config/config_multi_personas.yaml 32 \
+	$(PYTHON) src/data_generation.py config/config_multi_personas.yaml 20 \
 		--multiple-personas \
 		--batch \
 		--personas config/personas.yaml
@@ -38,7 +38,7 @@ generate-batch-100:
 
 # Generate diaries for multiple personas sequentially (slower)
 generate-multi:
-	$(PYTHON) src/data_generation.py config/config_multi_personas.yaml 32 \
+	$(PYTHON) src/data_generation.py config/config_multi_personas.yaml 22 \
 		--multiple-personas \
 		--personas config/personas.yaml
 

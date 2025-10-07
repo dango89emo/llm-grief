@@ -362,25 +362,40 @@ def generate_diary(
     with torch.no_grad():
         generated_ids = model.generate(**model_inputs, **generation_config)
 
+    prompt_len = model_inputs.input_ids.shape[1]
+    full_sequence_ids = generated_ids[0].tolist()
+
     # Get activations if collector is present
     activations = None
     tokens = None
     if activation_collector:
         activations = activation_collector.get_last_activations()
+        generated_only_ids = full_sequence_ids[prompt_len:]
+        if isinstance(activations, torch.Tensor):
+            if activations.dim() == 2:
+                activations = activations[prompt_len:]
+            elif activations.dim() == 3:
+                activations = activations[:, prompt_len:]
+        else:
+            activations = None
         # Get tokens for the full sequence (input + generated)
         # Store both individual token text and the full decoded text for each position
-        token_ids = generated_ids[0].tolist()
-        tokens = []
-        for i, tid in enumerate(token_ids):
-            # Decode individual token (may be incomplete for multi-byte chars)
-            token_text = tokenizer.decode([tid], skip_special_tokens=False)
-            # Decode from start to current position to get proper context
-            decoded_so_far = tokenizer.decode(token_ids[:i+1], skip_special_tokens=True)
-            tokens.append({
-                "token_id": tid,  # Store token ID for reference
-                "token_text": token_text,
-                "decoded_context": decoded_so_far
-            })
+        if generated_only_ids:
+            tokens = []
+            for i, tid in enumerate(generated_only_ids):
+                # Decode individual token (may be incomplete for multi-byte chars)
+                token_text = tokenizer.decode([tid], skip_special_tokens=False)
+                # Decode only the generated portion up to current position
+                decoded_so_far = tokenizer.decode(
+                    generated_only_ids[: i + 1], skip_special_tokens=True
+                )
+                tokens.append(
+                    {
+                        "token_id": tid,  # Store token ID for reference
+                        "token_text": token_text,
+                        "decoded_context": decoded_so_far,
+                    }
+                )
 
     # Decode, removing the input prompt
     generated_ids = [
@@ -449,9 +464,17 @@ def generate_diaries_batch(
     activations_list = []
     tokens_list = []
 
-    for i, (input_ids, output_ids) in enumerate(zip(model_inputs.input_ids, generated_ids)):
+    for idx, (input_ids, output_ids) in enumerate(zip(model_inputs.input_ids, generated_ids)):
         # Find the actual input length (excluding padding)
-        actual_input_len = (input_ids != tokenizer.pad_token_id).sum().item()
+        attention_mask = model_inputs.attention_mask[idx] if "attention_mask" in model_inputs else None
+        if attention_mask is not None:
+            actual_input_len = attention_mask.sum().item()
+        else:
+            pad_token_id = tokenizer.pad_token_id
+            if pad_token_id is not None:
+                actual_input_len = (input_ids != pad_token_id).sum().item()
+            else:
+                actual_input_len = input_ids.shape[0]
         # Extract only the generated portion
         generated_only = output_ids[actual_input_len:]
         response = tokenizer.decode(generated_only, skip_special_tokens=True)
@@ -462,23 +485,38 @@ def generate_diaries_batch(
             # Get tokens for the full sequence
             # Store both individual token text and the full decoded text for each position
             token_ids = output_ids.tolist()
-            # Remove padding tokens
-            token_ids_no_pad = [tid for tid in token_ids if tid != tokenizer.pad_token_id]
+            pad_token_id = tokenizer.pad_token_id
+            token_ids_no_pad = (
+                [tid for tid in token_ids if tid != pad_token_id]
+                if pad_token_id is not None
+                else token_ids
+            )
+            generated_tokens = token_ids_no_pad[int(actual_input_len):]
             tokens = []
-            for i, tid in enumerate(token_ids_no_pad):
+            for j, tid in enumerate(generated_tokens):
                 # Decode individual token (may be incomplete for multi-byte chars)
                 token_text = tokenizer.decode([tid], skip_special_tokens=False)
-                # Decode from start to current position to get proper context
-                decoded_so_far = tokenizer.decode(token_ids_no_pad[:i+1], skip_special_tokens=True)
-                tokens.append({
-                    "token_id": tid,  # Store token ID for reference
-                    "token_text": token_text,
-                    "decoded_context": decoded_so_far
-                })
-            tokens_list.append(tokens)
+                # Decode only the generated portion up to current position
+                decoded_so_far = tokenizer.decode(
+                    generated_tokens[: j + 1], skip_special_tokens=True
+                )
+                tokens.append(
+                    {
+                        "token_id": tid,  # Store token ID for reference
+                        "token_text": token_text,
+                        "decoded_context": decoded_so_far,
+                    }
+                )
+            tokens_list.append(tokens if tokens else None)
 
             # Get separated activations for this sample
-            activations_list.append(separated_activations[i] if i < len(separated_activations) else None)
+            sample_act = separated_activations[idx] if idx < len(separated_activations) else None
+            if isinstance(sample_act, torch.Tensor):
+                if sample_act.dim() == 2 and sample_act.shape[0] >= int(actual_input_len):
+                    sample_act = sample_act[int(actual_input_len):]
+                elif sample_act.dim() == 3 and sample_act.shape[1] >= int(actual_input_len):
+                    sample_act = sample_act[:, int(actual_input_len):]
+            activations_list.append(sample_act)
         else:
             activations_list.append(None)
             tokens_list.append(None)
